@@ -19,13 +19,18 @@
 
 
 #define CHUNK_SIZE 1024000
+#define SUCCESS 0
+#define ERROR -1
 
+void xor_op(char* buffer_1,char* buffer_2,char* out_buffer, int length);
+int get_size_file(int file_desc);
+void* thread_work(void* in_file_path);
 // Global parameters
 // locks
 pthread_mutex_t buffer_mutex, num_of_offline;
-int output_fd;
 pthread_cond_t finish_cv;
 char result_buffer[CHUNK_SIZE];
+int output_fd, count_curr_offline;
 
 // Helpers functions
 // * assume length is the minimal size of these two buffers
@@ -39,13 +44,50 @@ int get_size_file(int file_desc) {
     struct stat st;
     if (fstat(file_desc, &st) == -1) {
         perror("ERROR: fstat failed");
-        return -1;
+        exit(-1);
     }
     return(st.st_size);
 }
 
-void* thread_work(void* file_path) {
-    
+void* thread_work(void* in_file_path) {
+    char* file_path = (char *)in_file_path;
+    int total, num_read, size_file, fd;
+    char buffer[CHUNK_SIZE];
+    fd = open(file_path, O_RDONLY);
+    if (fd < 0) {
+        perror("Error while opening input file");
+        exit(-1);
+    }
+    size_file = get_size_file(fd);
+    if (size_file < 0) {
+        perror("Error file size");
+        exit(-1);
+    }
+    total = 0;
+    bool flag = true;
+    while (flag) {
+        // read 1024kb from the file
+        num_read = read(fd, buffer, CHUNK_SIZE);
+        if (num_read < 0) {
+            perror("Error with read");
+            exit(-1);
+        }
+        total += num_read;
+        // check if we end the file! 
+        if (total == size_file) {
+            if (pthread_mutex_lock(&num_of_offline) != 0) {
+                perror("Error lock");
+                exit(-1);
+            }
+            count_curr_offline++;
+            if (pthread_mutex_unlock(&num_of_offline) != 0){
+                perror("Error unlock");
+                exit(-1);
+            }
+        }
+        //=======Critical section===============
+
+    }
 }
 
 int main(int argc, char** argv) {
@@ -55,7 +97,7 @@ int main(int argc, char** argv) {
     int num_input_files = argc - 2;
     // init current active threads count
     active_threads = num_input_files;
-    char buffer[CHUNK_SIZE], res[CHUNK_SIZE];
+    // char buffer[CHUNK_SIZE], res[CHUNK_SIZE];
     printf("Hello, creating %s from %d input files\n", out_file, num_input_files);
     int out_fd = open(argv[1], O_WRONLY|O_CREAT|O_TRUNC, 00777);
     if (out_fd < 0){
@@ -88,7 +130,7 @@ int main(int argc, char** argv) {
     }
     // --- create reader thread for every input file ---- 
     for (int j=2; j < argc ; j++) {
-        if (pthread_create(&threads[j-2], NULL, thread_work, argv[i]) != 0) {
+        if (pthread_create(&threads[j-2], NULL, thread_work, argv[j]) != 0) {
             perror("Error creating threads");
             exit(-1);
         }
@@ -125,5 +167,5 @@ int main(int argc, char** argv) {
         perror("Error destroy cv");
         exit(-1);
     }
-    return 0; 
+    exit(0); 
 }
