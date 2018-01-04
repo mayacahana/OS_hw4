@@ -18,26 +18,30 @@
 #include <sys/stat.h>
 
 
-#define CHUNK_SIZE 1024000
+#define CHUNK_SIZE 1048576
+// #define CHUNK_SIZE 1024
 #define SUCCESS 0
 #define ERROR -1
 
 void xor_op(char* buffer_1,char* buffer_2, int length);
 int get_size_file(int file_desc);
-void* thread_work(void* in_file_path);
+void* xor_files(void* in_file_path);
+int read_file(int fd, char* buffer);
+int write_output(int fd_out, char buffer[CHUNK_SIZE], int total_threads_read);
 // Global parameters
 // locks
-pthread_mutex_t buffer_mutex, num_of_offline;
+pthread_mutex_t buffer_mutex, offline_mutex;
 pthread_cond_t finish_cv;
 char result_buffer[CHUNK_SIZE];
-int output_fd, count_curr_offline,num_curr_active, xor_cnt, total_threads_read=0;
+int output_fd, offline_threads,num_curr_active, xor_cnt, total_threads_read=0;
 
 // Helpers functions
 // * assume length is the minimal size of these two buffers
 void xor_op(char* buffer_1,char* buffer_2, int length){
-    while (length--){
-        buffer_1++;
-        *buffer_1 = *buffer_1 ^ *buffer_2++;
+   
+    //XORING THE CHUNK
+    for (int i=0 ; i < length; i++) {
+        buffer_1[i] = buffer_1[i] ^ buffer_2[i];
     }
 }
 
@@ -50,42 +54,74 @@ int get_size_file(int file_desc) {
     return(st.st_size);
 }
 
-void* thread_work(void* in_file_path) {
+int read_file(int fd, char* buffer) {
+    int total = 0, num_read;
+    while (total < CHUNK_SIZE) {
+        num_read = read(fd, buffer+total, CHUNK_SIZE - total);
+        if (num_read < 0) {
+            perror("Error with read");
+            exit(-1);
+        }
+        if (num_read == 0) { //eof
+            return total;
+        }
+        total+=num_read;
+    }
+    return total;
+}
+
+int write_output(int fd_out, char buffer[CHUNK_SIZE], int total_threads_read) {
+    int bytes_sent = 0;
+    while (bytes_sent < CHUNK_SIZE) {
+       bytes_sent = write(output_fd, result_buffer + bytes_sent, total_threads_read);
+       if (bytes_sent < 0) {
+           perror("ERROR:");
+            exit(-1);
+       }
+       total_threads_read -= bytes_sent;
+       if (total_threads_read == 0) {
+           return bytes_sent;
+       }
+    }
+    return bytes_sent;
+}
+
+
+void* xor_files(void* in_file_path) {
     char* file_path = (char *)in_file_path;
     int total, num_read, size_file, fd;
     char buffer[CHUNK_SIZE];
+    // open the input file
     fd = open(file_path, O_RDONLY);
     if (fd < 0) {
         perror("Error while opening input file");
         exit(-1);
     }
+    // get size of input file
     size_file = get_size_file(fd);
     if (size_file < 0) {
         perror("Error file size");
         exit(-1);
     }
     total = 0;
-    bool flag = true;
+    bool flag = true; //to determine when we got to the end of input file
     while (flag) {
-        // read 1024kb from the file
-        num_read = read(fd, buffer, CHUNK_SIZE);
-        if (num_read < 0) {
-            perror("Error with read");
-            exit(-1);
-        }
+        // try to read 1024kb from the file - TODO:check this
+        num_read = read_file(fd, buffer);
+        // sum the bytes read from the input file
         total += num_read;
         // check if we end the file! 
         if (total == size_file) {
-            if (pthread_mutex_lock(&num_of_offline) != 0) {
+            if (pthread_mutex_lock(&offline_mutex) != 0) {
                 perror("Error lock");
                 exit(-1);
             }
-            count_curr_offline++;
-            if (pthread_mutex_unlock(&num_of_offline) != 0){
+            offline_threads++;
+            if (pthread_mutex_unlock(&offline_mutex) != 0){
                 perror("Error unlock");
                 exit(-1);
             }
-            flag=false;
+            flag = false; //end while
         }
         //=======Critical section===============
         if (pthread_mutex_lock(&buffer_mutex) != 0) {
@@ -104,13 +140,13 @@ void* thread_work(void* in_file_path) {
                 exit(-1);
             }
         } else {
-            if (write(output_fd, result_buffer, total_threads_read) < 0){
+            if (write_output(output_fd, result_buffer, total_threads_read) < 0){
                 perror("ERROR:");
                 exit(-1);
             }
-            // init variables
-            num_curr_active -= count_curr_offline;
-            count_curr_offline = 0;
+            // init variables after writing
+            num_curr_active -= offline_threads;
+            offline_threads = 0;
             xor_cnt=0;
             total_threads_read = 0;
             memset(result_buffer, 0, sizeof(result_buffer));
@@ -137,15 +173,16 @@ void* thread_work(void* in_file_path) {
 
 
 int main(int argc, char** argv) {
-    char* out_file = argv[1];
-    int rc, rc_offline, rc_cv, out_size;
+    //char* out_file = argv[1];
+    int rc, rc_offline, rc_cv, out_size, i;
     pthread_t *threads;
     num_curr_active = argc - 2;
     // init current active threads count
     // char buffer[CHUNK_SIZE], res[CHUNK_SIZE];
-    printf("Hello, creating %s from %d input files\n", out_file, num_curr_active);
-    int out_fd = open(argv[1], O_WRONLY|O_CREAT|O_TRUNC, 00777);
-    if (out_fd < 0){
+    printf("Hello, creating %s from %d input files\n", argv[1], num_curr_active);
+    //printf("%s", argv[1]);
+    output_fd = open(argv[1], O_WRONLY | O_CREAT | O_TRUNC, 00777);
+    if (output_fd < 0){
         perror("ERROR: ");
         exit(-1);
     }
@@ -157,7 +194,7 @@ int main(int argc, char** argv) {
         perror("ERROR in pthread_mutex_init");
         exit(-1);
     }
-    rc_offline = pthread_mutex_init(&num_of_offline, NULL);
+    rc_offline = pthread_mutex_init(&offline_mutex, NULL);
     if (rc_offline) {
         perror("ERROR in pthread_mutex_init");
         exit(-1);
@@ -168,22 +205,23 @@ int main(int argc, char** argv) {
         exit(-1);
     }
     // ----- init threads ------
-    threads = malloc((argc-2) * sizeof(pthread_t*));
-    if (!threads) {
-        perror("Error in malloc threads");
-        exit(-1);
-    }
+    threads = (pthread_t *) malloc((argc-2) * sizeof(pthread_t));
+    // printf("5 success\n");
+    // fflush(stdout);
     // --- create reader thread for every input file ---- 
-    for (int j=2; j < argc ; j++) {
-        if (pthread_create(&threads[j-2], NULL, thread_work, argv[j]) != 0) {
+    for (i = 0 ; i < argc-2 ; i++) {
+        if (pthread_create(&threads[i], NULL, xor_files,(void *) argv[i+2]) != 0) {
             perror("Error creating threads");
             exit(-1);
         }
     }
+    // printf("6 success\n");
+    // fflush(stdout);
     // --- Wait for all threads to complete --- 
-    for (int k=0; k < argc-2; k++) {
-        if (pthread_join(threads[k], NULL) != 0) {
+    for (i = 0; i < argc-2; i++) {
+        if (pthread_join(threads[i], NULL) != 0) {
             perror("Error joining threads");
+            fflush(stderr);
             exit(-1);
         }
     }
@@ -197,14 +235,14 @@ int main(int argc, char** argv) {
         perror("ERROR:");
         exit(-1);
     }
-    printf("Created %s with size %d bytes\n", out_file, out_size);
+    printf("Created %s with size %d bytes\n", argv[1], out_size);
     // --- Clean up and exit ---- 
     free(threads);
     if (pthread_mutex_destroy(&buffer_mutex) != 0){
         perror("Error destoy mutex");
         exit(-1);
     }
-    if (pthread_mutex_destroy(&num_of_offline) != 0){
+    if (pthread_mutex_destroy(&offline_mutex) != 0){
         perror("Error destroy mutex");
         exit(-1);
     }
@@ -212,5 +250,6 @@ int main(int argc, char** argv) {
         perror("Error destroy cv");
         exit(-1);
     }
+
     exit(0); 
 }
